@@ -8,6 +8,7 @@ from datetime import datetime
 from wcwidth import wcswidth  # pip install wcwidth
 
 FEED_URL = "https://trends.google.com/trending/rss?geo=TW"
+FEED_URL = "https://news.ycombinator.com/rss"
 POLL_INTERVAL_SECONDS = 60  # fetch every minute
 
 MAX_TRAFFIC = 2_000_000  # cap traffic at 2M for plotting
