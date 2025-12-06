@@ -5,6 +5,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
+from alert_system import send_to_telegram
 
 import requests
 
@@ -72,6 +73,8 @@ def print_items(items):
         print(item["title"])
         print(item["link"])
         print()  # blank line
+        send_to_telegram(f"{item['title']},{item['link']}")
+
 
 
 def check_once(last_pub_date):
