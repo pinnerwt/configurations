@@ -1,271 +1,167 @@
-import math
-import subprocess
+#!/usr/bin/env python3
+"""
+Poll Google Trends TW trending RSS every minute.
+Print newest element(s) if any.
+Resume correctly after restart using persisted state.
+
+Correct link behavior:
+- Use ht_news_item_url if present
+- Use ht_news_item_title as the title if present
+- Ignore entry.link (it's always the feed URL)
+"""
+
+import json
+import os
 import time
-import urllib.request
-import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from wcwidth import wcswidth  # pip install wcwidth
+import feedparser
+import requests
 
-FEED_URL = "https://trends.google.com/trending/rss?geo=TW"
-FEED_URL = "https://news.ycombinator.com/rss"
-POLL_INTERVAL_SECONDS = 60  # fetch every minute
-
-MAX_TRAFFIC = 2_000_000  # cap traffic at 2M for plotting
-MAX_BAR_LEN = 60  # max number of '#' characters in bar
-
-POPUP_TMP_FILE = "/tmp/google_trends_popup.txt"  # temp file for tmux popup content
+RSS_URL = "https://trends.google.com.tw/trending/rss?geo=TW"
+STATE_FILE = "rss_state.json"
+POLL_SECONDS = 60
+TIMEOUT = 15
 
 
-def fetch_rss_xml(url: str) -> bytes:
-    """Download the RSS XML from the given URL."""
-    with urllib.request.urlopen(url) as resp:
-        return resp.read()
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def parse_items(xml_data: bytes):
+def load_state(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {"last_seen_uid": None, "updated_at": None}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"last_seen_uid": None, "updated_at": None}
+
+
+def save_state(path: str, state: Dict[str, Any]) -> None:
+    state = dict(state)
+    state["updated_at"] = utc_now_iso()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def fetch_feed(url: str) -> feedparser.FeedParserDict:
+    headers = {"User-Agent": "rss-poller/1.0"}
+    resp = requests.get(url, headers=headers, timeout=TIMEOUT)
+    resp.raise_for_status()
+    return feedparser.parse(resp.content)
+
+
+def entry_uid(entry: feedparser.FeedParserDict) -> str:
     """
-    Parse the RSS XML and return a list of items.
+    Stable ID for resume purposes.
+    Prefer ht_news_item_url; otherwise fall back to title + published time.
+    """
+    url = entry.get("ht_news_item_url")
+    if url:
+        return str(url)
 
-    Each item:
-    {
-        "title": str,
-        "traffic": int,
-        "pubdate": str,
-        "news_items": [
-            {"title": str, "source": str, "url": str},
-            ...
-        ]
+    title = entry.get("title", "")
+    published = entry.get("published", "")
+    return f"{title}::{published}"
+
+
+def extract_item(entry: feedparser.FeedParserDict) -> Optional[Dict[str, str]]:
+    """
+    Extract the *actual* item Google Trends intends:
+    - title: ht_news_item_title (preferred)
+    - url:   ht_news_item_url (preferred)
+    """
+    url = entry.get("ht_news_item_url")
+    title = entry.get("ht_news_item_title") or entry.get("title")
+
+    if not url and not title:
+        return None
+
+    return {
+        "keyword": entry.get("title"),
+        "title": title or "",
+        "url": url or "",
+        "published": entry.get("published", "") or "",
+        "source": entry.get("ht_news_item_source", "") or "",
     }
-    """
-    root = ET.fromstring(xml_data)
-    ns = {"ht": "https://trends.google.com/trending/rss"}
 
-    items = []
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        if not title:
-            continue
 
-        pubdate = (item.findtext("pubDate") or "").strip()
-        traffic_raw = (
-            item.findtext("ht:approx_traffic", "", namespaces=ns) or ""
-        ).strip()
+def format_item(item: Dict[str, str]) -> str:
+    lines = [f"🆕 {item['keyword']}", f"   Title: {item['title']}"]
+    if item["published"]:
+        lines.append(f"   Published: {item['published']}")
+    if item["url"]:
+        lines.append(f"   Link: {item['url']}")
+    if item["source"]:
+        lines.append(f"   Source: {item['source']}")
+    return "\n".join(lines)
 
-        if traffic_raw:
-            # Handle "1,000+" / "1000+"
-            traffic_raw_clean = traffic_raw.replace(",", "").replace("+", "")
-            try:
-                traffic = int(traffic_raw_clean)
-            except ValueError:
-                traffic = 0
-        else:
-            traffic = 0
 
-        news_items = []
-        for ni in item.findall("ht:news_item", ns):
-            ni_title = (
-                ni.findtext("ht:news_item_title", default="", namespaces=ns) or ""
-            ).strip()
-            ni_source = (
-                ni.findtext("ht:news_item_source", default="", namespaces=ns) or ""
-            ).strip()
-            ni_url = (
-                ni.findtext("ht:news_item_url", default="", namespaces=ns) or ""
-            ).strip()
+def get_new_entries(
+    entries: List[feedparser.FeedParserDict],
+    last_seen_uid: Optional[str],
+) -> List[feedparser.FeedParserDict]:
+    if not entries or not last_seen_uid:
+        return []
 
-            if ni_title:
-                news_items.append(
-                    {
-                        "title": ni_title,
-                        "source": ni_source,
-                        "url": ni_url,
-                    }
-                )
+    new_items = []
+    for e in entries:
+        if entry_uid(e) == last_seen_uid:
+            break
+        new_items.append(e)
+    return new_items
 
-        items.append(
-            {
-                "title": title,
-                "traffic": traffic,
-                "pubdate": pubdate,
-                "news_items": news_items,
-            }
+
+def main() -> None:
+    state = load_state(STATE_FILE)
+    last_seen_uid = state.get("last_seen_uid")
+
+    print(f"Polling: {RSS_URL}")
+    print(f"State:   {STATE_FILE}")
+    if last_seen_uid:
+        print(f"Resuming from last_seen_uid={last_seen_uid}")
+    else:
+        last_seen_uid = 1
+        print(
+            "No prior state found. First run will record current item without printing."
         )
-
-    return items
-
-
-def scaled_bar_len(traffic: int) -> int:
-    """
-    Compute bar length using log10(traffic), with:
-    - traffic clamped to [1, MAX_TRAFFIC]
-    - result scaled to [1, MAX_BAR_LEN]
-    """
-    if traffic <= 0:
-        traffic = 1
-
-    t = min(traffic, MAX_TRAFFIC)
-    log_t = math.log10(t)
-    log_max = math.log10(MAX_TRAFFIC)
-    frac = log_t / log_max if log_max > 0 else 0.0
-
-    bar_len = int(frac * MAX_BAR_LEN)
-    return max(bar_len, 1)
-
-
-def tmux_popup(new_items):
-    """
-    Show a tmux popup summarizing new items.
-    Uses a temp file to avoid shell-quoting issues.
-    """
-    if not new_items:
-        return
-
-    lines = []
-    lines.append(
-        f"New Google Trends ({len(new_items)} item(s)) @ {datetime.now().strftime('%H:%M:%S')}"
-    )
-    lines.append("-" * 60)
-
-    # Show up to 10 new items in popup
-    for it in new_items[:10]:
-        title = it["title"]
-        traffic = it["traffic"]
-        lines.append(f"- {title} ({traffic})")
-
-        # Optionally show first news headline
-        if it["news_items"]:
-            first_news = it["news_items"][0]
-            src = first_news["source"]
-            ntitle = first_news["title"]
-            if src:
-                lines.append(f"    [{src}] {ntitle}")
-            else:
-                lines.append(f"    {ntitle}")
-
-    text = "\n".join(lines) + "\n"
-
-    try:
-        # Write content to temp file
-        with open(POPUP_TMP_FILE, "w", encoding="utf-8") as f:
-            f.write(text)
-
-        # Open popup that just cats the file
-        subprocess.run(
-            [
-                "tmux",
-                "popup",
-                "-w",
-                "70%",  # width
-                "-h",
-                "40%",  # height
-                "-E",
-                f"cat {POPUP_TMP_FILE}",
-            ],
-            check=False,
-        )
-    except Exception:
-        # Fail silently if tmux is not available or popup fails
-        pass
-
-
-def tmux_set_message(msg: str):
-    try:
-        subprocess.run(
-            ["tmux", "set-option", "-gq", "@trend_message", msg], check=False
-        )
-    except Exception:
-        pass
-
-
-def print_new_items(new_items, min_title_width=20):
-    """
-    Print new trend items + their news headlines in the main pane.
-    Layout:
-      <title padded> | <bar> (<traffic>)  [pubdate]
-          - [source] news_title (url)
-    """
-    if not new_items:
-        return
-
-    print("\n" + "=" * 100)
-    print(f"New items at {datetime.now().isoformat(timespec='seconds')}")
-    print("=" * 100)
-
-    # 1) title width for left alignment (handles CJK)
-    max_title_width = max(wcswidth(it["title"]) for it in new_items)
-    title_pad_to = max(max_title_width, min_title_width)
-
-    # 2) build left parts and measure widths
-    left_parts = []  # (left_string, pubdate, news_items)
-    left_widths = []
-
-    for it in new_items:
-        title = it["title"]
-        traffic = it["traffic"]
-
-        pad = title_pad_to - wcswidth(title)
-        padded_title = title + (" " * pad)
-
-        bar = "#" * scaled_bar_len(traffic)
-        left = f"{padded_title} | {bar} ({traffic})"
-
-        left_parts.append((left, it["pubdate"], it["news_items"]))
-        left_widths.append(wcswidth(left))
-
-    max_left_width = max(left_widths)
-
-    # 3) print lines with aligned timestamps, then indented news
-    for (left, pubdate, news_items), lw in zip(left_parts, left_widths):
-        gap = max_left_width - lw
-        spaces = " " * gap
-        print(f"{left}{spaces}  [{pubdate}]")
-
-        for ni in news_items:
-            src = ni["source"]
-            ntitle = ni["title"]
-            url = ni["url"]
-
-            if src:
-                head = f"[{src}] {ntitle}"
-            else:
-                head = ntitle
-
-            if url:
-                line = f"    - {head} ({url})"
-            else:
-                line = f"    - {head}"
-
-            print(line)
-
-
-def main():
-    # ensure each entry (title + pubdate) is shown only once
-    seen = set()
 
     while True:
         try:
-            xml_data = fetch_rss_xml(FEED_URL)
-            items = parse_items(xml_data)
+            feed = fetch_feed(RSS_URL)
+            entries = list(feed.entries or [])
 
-            new_items = []
-            for it in items:
-                key = f"{it['title']}|{it['pubdate']}"
-                if key not in seen:
-                    seen.add(key)
-                    new_items.append(it)
-                    tmux_set_message(key)
+            if entries:
+                newest = entries[0]
+                newest_uid = entry_uid(newest)
 
-            # Print to the current tmux pane
-            print_new_items(new_items)
+                if not last_seen_uid:
+                    # First run: initialize state only
+                    last_seen_uid = newest_uid
+                    state["last_seen_uid"] = last_seen_uid
+                    save_state(STATE_FILE, state)
+                else:
+                    new_entries = get_new_entries(entries, last_seen_uid)
 
-            # Show popup summary in tmux
-            # tmux_popup(new_items)
+                    if new_entries:
+                        for e in reversed(new_entries):
+                            item = extract_item(e)
+                            if item:
+                                print(format_item(item))
+                                print("-" * 60)
+
+                        last_seen_uid = newest_uid
+                        state["last_seen_uid"] = last_seen_uid
+                        save_state(STATE_FILE, state)
 
         except Exception as e:
-            print(f"Error while fetching/parsing feed: {e}")
+            print(f"[{utc_now_iso()}] Error: {e}")
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
