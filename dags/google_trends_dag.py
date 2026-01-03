@@ -15,9 +15,9 @@ import logging
 # Add project root to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from src.scraper import collect_trends_for_region
-from src.geo_codes import load_geo_codes
-from src.database import init_database
+from trend.scraper import collect_trends_for_region
+from trend.geo_codes import load_geo_codes
+from trend.database import init_database
 
 logger = logging.getLogger(__name__)
 
