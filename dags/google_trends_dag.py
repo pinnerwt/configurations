@@ -25,7 +25,9 @@ logger = logging.getLogger(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'trends.db')
 
 # Initialize database on DAG load
+logger.info(f"Initializing database at {DB_PATH}")
 init_database(DB_PATH)
+logger.info("Database initialization complete")
 
 # Default arguments for DAG
 default_args = {
@@ -49,7 +51,7 @@ dag = DAG(
 )
 
 
-def collect_trends_task(country_code: str) -> int:
+def collect_trends_task(country_code: str, **context) -> int:
     """Task function to collect trends for a specific country code.
 
     Args:
@@ -59,25 +61,56 @@ def collect_trends_task(country_code: str) -> int:
         Number of trends collected
     """
     try:
+        run_id = context.get('run_id')
+        dag_id = context.get('dag').dag_id if context.get('dag') else None
+        task_id = context.get('task').task_id if context.get('task') else None
+        try_number = context.get('ti').try_number if context.get('ti') else None
+        logger.info(
+            "Starting trends collection for %s (dag_id=%s, task_id=%s, run_id=%s, try_number=%s, db_path=%s)",
+            country_code,
+            dag_id,
+            task_id,
+            run_id,
+            try_number,
+            DB_PATH,
+        )
         count = collect_trends_for_region(country_code, DB_PATH)
-        logger.info(f"Successfully collected {count} trends for {country_code}")
+        logger.info(
+            "Successfully collected %s trends for %s (dag_id=%s, task_id=%s, run_id=%s, try_number=%s)",
+            count,
+            country_code,
+            dag_id,
+            task_id,
+            run_id,
+            try_number,
+        )
         return count
     except Exception as e:
-        logger.error(f"Failed to collect trends for {country_code}: {e}")
+        logger.exception(
+            "Failed to collect trends for %s (dag_id=%s, task_id=%s, run_id=%s, try_number=%s)",
+            country_code,
+            dag_id,
+            task_id,
+            run_id,
+            try_number,
+        )
         raise
 
 
 # Load geo codes and create a task for each country
 try:
-    geo_codes = load_geo_codes(os.path.join(os.path.dirname(__file__), '..', 'geo_codes'))
+    geo_codes_path = '/x/home_pgi/trend/geo_codes'
+    logger.info(f"Loading geo codes from {geo_codes_path}")
+    geo_codes = load_geo_codes(geo_codes_path)
     logger.info(f"Loaded {len(geo_codes)} country codes")
 except Exception as e:
-    logger.error(f"Failed to load geo codes: {e}")
+    logger.exception("Failed to load geo codes")
     geo_codes = []
 
 # Create a task for each country code
 for geo_info in geo_codes:
     code = geo_info['code']
+    logger.debug(f"Creating task for country code {code}")
     task = PythonOperator(
         task_id=f'collect_{code}',
         python_callable=collect_trends_task,
